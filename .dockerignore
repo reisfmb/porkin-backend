@@ -1,0 +1,14 @@
+# Keep the build context small, and keep local state/secrets out of the image —
+# prod config comes from Railway variables, never a baked-in .env.
+node_modules
+dist
+data
+.env*
+*.db
+*.db-shm
+*.db-wal
+.git
+.DS_Store
+*.md
+Dockerfile
+.dockerignore

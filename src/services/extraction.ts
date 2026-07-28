@@ -1,5 +1,6 @@
 import { runExtractor, ExtractError } from "../llm/extractor.js";
 import { recordUsage } from "../db/usage.js";
+import { config } from "../config.js";
 import { ApiError } from "../errors.js";
 import type { ExtractedTransaction } from "../types.js";
 
@@ -21,11 +22,22 @@ export async function extractStatement({
 }: ExtractInput): Promise<ExtractedTransaction[]> {
   try {
     const { transactions, inputTokens, outputTokens } = await runExtractor(pdfBytes, filename);
-    recordUsage({ userId, fileName: filename, fileSize, inputTokens, outputTokens, ok: true });
+    recordUsage({
+      userId,
+      endpoint: "extract",
+      model: config.model,
+      fileName: filename,
+      fileSize,
+      inputTokens,
+      outputTokens,
+      ok: true,
+    });
     return transactions;
   } catch (err) {
     recordUsage({
       userId,
+      endpoint: "extract",
+      model: config.model,
       fileName: filename,
       fileSize,
       inputTokens: null,

@@ -25,4 +25,14 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
       CREATE INDEX idx_usage_user ON usage(user_id, created_at);
     `,
   },
+  {
+    version: 2,
+    // `usage` was extract-shaped (file_name/file_size). Generalize it so every
+    // billable LLM call is logged, whichever endpoint made it. The DEFAULT
+    // back-fills existing rows correctly — they were all extractions.
+    sql: `
+      ALTER TABLE usage ADD COLUMN endpoint TEXT NOT NULL DEFAULT 'extract';
+      ALTER TABLE usage ADD COLUMN model TEXT;
+    `,
+  },
 ];

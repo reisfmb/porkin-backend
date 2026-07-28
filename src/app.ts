@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { errorHandler } from "./errors.js";
 import { healthRoutes } from "./routes/health.js";
 import { extractRoutes } from "./routes/extract.js";
+import { askRoutes } from "./routes/ask.js";
 import { adminRoutes } from "./routes/admin.js";
 import type { AppEnv } from "./middleware/auth.js";
 
@@ -11,6 +12,7 @@ export function createApp() {
   app.onError(errorHandler);
   app.route("/", healthRoutes);
   app.route("/", extractRoutes);
+  app.route("/", askRoutes);
   app.route("/", adminRoutes);
   return app;
 }

@@ -6,9 +6,9 @@ Architecture and decisions, to guide future work in this repo.
 
 A tiny gated backend that moves Porkin off BYOK. Previously the [desktop app](../porkin-app)
 held the user's LLM key and called providers directly from the Tauri webview. This backend
-holds **one** server-side OpenAI key, issues **per-user license keys**, and exposes a PDF
-extraction endpoint. Goal: monetize Porkin (paid desktop app) while protecting the key.
-Starts for 3 trusted beta users but leaves room for quota/billing.
+holds **one** server-side OpenAI key, issues **per-user license keys**, and exposes two paid
+endpoints: PDF extraction and natural-language Q&A. Goal: monetize Porkin (paid desktop app)
+while protecting the key. Starts for 3 trusted beta users but leaves room for quota/billing.
 
 **Boundary:** this repo is backend-only. The porkin-app client changes (drop BYOK, call this
 API) are a separate, later task — do not touch porkin-app from here.
@@ -20,9 +20,13 @@ API) are a separate, later task — do not touch porkin-app from here.
   app. Only two things were dropped in the port: `fetch: tauriFetch` (use default fetch) and
   neverthrow (plain throw). The API key now comes from `PROVIDER_API_KEY` env, not client
   settings.
-- `src/types.ts` `ExtractedTransaction` duplicates the app's contract type. This ~5-field
-  JSON shape is the entire client/server contract — a stable duplication, not worth a shared
-  workspace. Keep both copies identical.
+- `src/types.ts` `ExtractedTransaction` duplicates the app's contract type, as do the `/v1/ask`
+  types (`AskContext`/`AskStep`/`AskRequest`/`AskResponse`, mirrored in
+  `porkin-app/src/lib/ask/types.ts`). These small JSON shapes are the entire client/server
+  contract — a stable duplication, not worth a shared workspace. Keep both copies identical.
+- `llm/sqlGuard.ts` is duplicated as `isReadOnlySql` in `porkin-app/src/lib/ask/model.ts`.
+  Deliberate: the app holds the writable DB handle, so it must not trust us to have checked.
+  Change one, change the other.
 
 ## Stack & key decisions
 
@@ -56,12 +60,16 @@ src/
   routes/
     health.ts           GET /health (open)
     extract.ts          POST /v1/extract — thin: validate HTTP input → call service → respond
+    ask.ts              POST /v1/ask — hand-validated JSON body; one turn of the text-to-SQL loop
     admin.ts            /v1/admin/users CRUD-ish (create/list/activate) behind adminAuth
   services/
     extraction.ts       business logic: orchestrate extractor + usage; translate ExtractError→ApiError
+    ask.ts              business logic: model call + SQL guard + retry + usage; MAX_STEPS lives here
     users.ts            business logic: issue license keys, list users, toggle active
   llm/
     extractor.ts        provider factory + generateObject (ported from app); throws domain ExtractError
+    asker.ts            ask prompt + message replay from `steps` + generateObject; throws AskError
+    sqlGuard.ts         pure: assertReadOnlySql — the model's SQL is untrusted output
   db/
     client.ts           better-sqlite3 open + pragmas + migrate-on-start (reads DB_PATH, loadEnvFile)
     migrations.ts       append-only MIGRATIONS array
@@ -88,6 +96,11 @@ in the service). `errorHandler` is the single seam that turns them into response
   `ExtractError` is translated to `ApiError` in `services/extraction.ts` (extraction→422,
   timeout→504). Routes/middleware never map statuses themselves.
 - **API is versioned** (`/v1/*`) so shipped desktop clients don't break on API evolution.
+- **`usage` is per LLM call, not per request.** One row per provider call, success *or* failure,
+  written best-effort. `endpoint` ('extract'|'ask') + `model` distinguish them — a 3-step ask
+  question writes 3 rows, which is the right granularity for cost-based quota. **Never store the
+  question text or query results**: the whole point of the ask design is that we don't retain the
+  user's financial data.
 - **Sub-app middleware is NOT scoped to the sub-app.** `app.route("/", subApp)` merges the
   sub-app's `use()` handlers into the parent, so their path patterns must be specific to the
   routes they guard — `extract.ts` uses `use("/v1/extract", …)`, not `"/v1/*"`, or license-key
@@ -96,11 +109,46 @@ in the service). `errorHandler` is the single seam that turns them into response
   `node dist/index.js`. (Was `dist/src/…` while a `scripts/` dir existed; if you re-add
   compiled scripts outside `src/`, `rootDir` and `start` both have to move back.)
 
+## `/v1/ask` — text-to-SQL over a database we can't see
+
+The user's transactions live in a local SQLite file on their machine; we hold the key. So the
+client drives an agent loop and we are one stateless turn of it:
+
+```
+app → { question, context, steps: [] }        ← context = live DDL + today/currency/locale
+                                                + category & account NAMES
+we  → { status: "sql", sql: "SELECT …" }
+app runs it LOCALLY, appends { sql, rows, truncated }
+app → { question, context, steps: [ … ] }
+we  → { status: "answer", answer: "…" }
+```
+
+Load-bearing details:
+
+- **Stateless.** The whole history arrives in `steps` and `asker.ts:buildMessages` replays it as
+  plain user/assistant turns. No session store, no sticky routing, survives a restart mid-question.
+- **`MAX_STEPS = 3`, enforced here** (`services/ask.ts`), not just in the client — a client could
+  otherwise loop on our key forever. On the final turn the prompt says "no more queries"; a `sql`
+  reply there is a `422 ask_failed`.
+- **Flat response schema, not tool-calls.** `{status, sql, answer}` with the unused field `""`,
+  same reason as `extractor.ts`: OpenAI strict structured outputs reject unions/optionals. It also
+  means the conversation serializes as text, with nothing tool-call-shaped to round-trip over HTTP.
+- **`assertReadOnlySql` gates every query** before it goes back. A rejection is fed to the model
+  for **one** inline correction attempt (its own LLM call → its own usage row) before 422.
+- **Schema comes from the client, semantics come from us.** The app sends live `sqlite_master`
+  DDL so shape can't drift from its migrations; the system prompt carries what DDL can't say
+  (signed amounts, `COALESCE(name, raw_name)`, the category pivot, one app-wide currency). If the
+  app changes what a column *means*, `asker.ts`'s prompt has to change with it.
+- **Rate limit is per loop iteration**, so a 3-step question spends 3 tokens of
+  `RATE_LIMIT_PER_MIN` (~6 questions/min at the default 20).
+
 ## Guards (in place — it's real money)
 
 Per-key rate limit (in-memory, fine for single instance), max upload size (Content-Length
-pre-check + actual size), 60s LLM-call timeout via `AbortSignal.timeout`. **Never log** the
-plaintext license key, `PROVIDER_API_KEY`, or `ADMIN_KEY`.
+pre-check + actual size), `maxAskBytes` 1 MB cap on ask bodies (query results ride in `steps`, so
+they aren't otherwise bounded), a server-side `MAX_STEPS` budget, `assertReadOnlySql` on all
+generated SQL, 60s LLM-call timeout via `AbortSignal.timeout`. **Never log** the plaintext license
+key, `PROVIDER_API_KEY`, or `ADMIN_KEY`.
 
 ## Auth model
 

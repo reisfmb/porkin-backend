@@ -53,3 +53,6 @@ export const config = {
 } as const;
 
 export const maxUploadBytes = config.maxUploadMb * 1024 * 1024;
+
+/** /v1/ask body cap. Query results ride along in `steps`, so it isn't trivially bounded. */
+export const maxAskBytes = 1024 * 1024;

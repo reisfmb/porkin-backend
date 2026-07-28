@@ -1,8 +1,8 @@
 # porkin-backend
 
-Managed PDF-extraction backend for [Porkin](../porkin-app). Holds one server-side OpenAI
-key, gates access with per-user license keys, and exposes a PDF → transactions endpoint that
-reuses the desktop app's extraction logic.
+Managed AI backend for [Porkin](../porkin-app). Holds one server-side OpenAI key, gates access
+with per-user license keys, and exposes two endpoints: PDF → transactions extraction (reusing
+the desktop app's logic) and natural-language Q&A over the user's local database.
 
 ## Stack
 
@@ -22,9 +22,9 @@ src/
   errors.ts       ApiError + errorHandler (the only place errors → HTTP)
   crypto.ts       key hashing + generation
   middleware/     auth (bearer key) · admin (ADMIN_KEY) · rateLimit (token bucket)
-  routes/         health · extract · admin (thin HTTP handlers)
-  services/       extraction · users (business logic; framework-agnostic)
-  llm/            extractor (AI SDK call; ported from porkin-app)
+  routes/         health · extract · ask · admin (thin HTTP handlers)
+  services/       extraction · ask · users (business logic; framework-agnostic)
+  llm/            extractor (ported from porkin-app) · asker · sqlGuard
   db/             client · migrations · users · usage (repositories)
 Dockerfile        multi-stage build; what Railway deploys
 railway.json      builder + /health healthcheck + single replica
@@ -68,11 +68,41 @@ curl -X POST localhost:8787/v1/extract \
   -F file=@statement.pdf
 ```
 
+### `POST /v1/ask`
+Auth required: `Authorization: Bearer <license-key>`.
+
+Answers questions about the user's finances. **We never see their database** — we emit SQL, the
+client runs it locally and posts the rows back. The client drives the loop; each call is
+stateless, so the full history travels in `steps` (max 3).
+
+- Body: `{ question, context, steps }` where
+  `context = { schema, today, currency, locale, categories, accounts }` (`schema` is the client's
+  live `sqlite_master` DDL) and each step is `{ sql, rows, truncated, error? }`.
+- Success: `200 { status, sql, answer }` — `status: "sql"` ⇒ run `sql` and call again with a new
+  step; `status: "answer"` ⇒ done, the unused field is `""`.
+- Errors: same `{ "error": { "kind", "message" } }` shape, with
+  `400` bad body / step budget exceeded · `401`/`403` key · `413` body too large ·
+  `422 ask_failed` couldn't answer or generated unsafe SQL · `429` rate-limited ·
+  `504` provider timeout.
+
+```bash
+curl -X POST localhost:8787/v1/ask \
+  -H "Authorization: Bearer <key>" -H 'Content-Type: application/json' \
+  -d '{"question":"How much came in during 2024?",
+       "context":{"schema":"CREATE TABLE transactions(id INTEGER PRIMARY KEY, date TEXT, raw_name TEXT, name TEXT, amount REAL);",
+                  "today":"2026-07-27","currency":"BRL","locale":"en","categories":[],"accounts":[]},
+       "steps":[]}'
+```
+
+Generated SQL is validated (`llm/sqlGuard.ts`) to be a single read-only SELECT/WITH before it
+leaves the server; the client re-validates before executing. A rejected query gets one inline
+correction attempt.
+
 ### Admin — `/v1/admin/*`
 
 Auth: `Authorization: Bearer $ADMIN_KEY`. The admin key is env-only (no `users` row) and
-grants access to these routes **only** — it is not accepted on `/v1/extract`. If `ADMIN_KEY`
-is unset, every admin route returns `401`.
+grants access to these routes **only** — it is not accepted on `/v1/extract` or `/v1/ask`. If
+`ADMIN_KEY` is unset, every admin route returns `401`.
 
 | Route | Body | Response |
 |-------|------|----------|

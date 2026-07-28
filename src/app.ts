@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { errorHandler } from "./errors.js";
 import { healthRoutes } from "./routes/health.js";
+import { licenseRoutes } from "./routes/license.js";
 import { extractRoutes } from "./routes/extract.js";
 import { askRoutes } from "./routes/ask.js";
 import { adminRoutes } from "./routes/admin.js";
@@ -11,6 +12,7 @@ export function createApp() {
   const app = new Hono<AppEnv>();
   app.onError(errorHandler);
   app.route("/", healthRoutes);
+  app.route("/", licenseRoutes);
   app.route("/", extractRoutes);
   app.route("/", askRoutes);
   app.route("/", adminRoutes);

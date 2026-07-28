@@ -49,6 +49,20 @@ curl localhost:8787/health          # {"status":"ok"}
 ### `GET /health`
 Unauthenticated. `200 {"status":"ok"}`.
 
+### `GET /v1/license`
+Auth required: `Authorization: Bearer <license-key>`.
+
+Checks whether a license key is usable — no LLM call, no usage row, not rate-limited.
+The app calls it when the user saves a key in Settings.
+
+- Success: `200 { "valid": true, "name": "<user name>" }`.
+- Errors: `401` missing/unknown key (`kind: "unauthorized"`) · `403` revoked key
+  (`kind: "inactive"`). There is no `valid: false` body — the status *is* the verdict.
+
+```bash
+curl -i localhost:8787/v1/license -H "Authorization: Bearer <key>"
+```
+
 ### `POST /v1/extract`
 Auth required: `Authorization: Bearer <license-key>`.
 

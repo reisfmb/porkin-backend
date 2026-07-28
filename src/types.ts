@@ -9,6 +9,15 @@ export type ExtractedTransaction = {
   sourceFile: string;
 };
 
+// ---- /v1/license ----
+// Duplicated in porkin-app (src/lib/settings/types.ts). Keep both copies identical.
+
+/** Only ever returned on success — an invalid key is a 401/403, not `valid: false`. */
+export type LicenseStatus = {
+  valid: true;
+  name: string;
+};
+
 // ---- /v1/ask ----
 // Also duplicated in porkin-app (src/lib/ask/types.ts). Same reasoning as
 // above: a small stable JSON shape isn't worth a shared workspace.

@@ -59,6 +59,7 @@ src/
     rateLimit.ts        in-memory per-user token bucket → throws ApiError(429); runs after auth
   routes/
     health.ts           GET /health (open)
+    license.ts          GET /v1/license — `auth` + an empty handler; no service, no rateLimit
     extract.ts          POST /v1/extract — thin: validate HTTP input → call service → respond
     ask.ts              POST /v1/ask — hand-validated JSON body; one turn of the text-to-SQL loop
     admin.ts            /v1/admin/users CRUD-ish (create/list/activate) behind adminAuth
@@ -164,6 +165,13 @@ Two independent credentials, both sent as `Authorization: Bearer <key>`:
   special-casing usage logging. An operator who wants to extract issues themselves a normal
   license key. If that ever changes, do it with an `is_admin` column + a real seeded row, not a
   synthetic user object.
+
+`GET /v1/license` exposes that middleware as an endpoint: it is `auth` plus a handler that
+only echoes the user's name, so **reaching the handler is the verdict** — an unknown key 401s
+(`unauthorized`) and a revoked one 403s (`inactive`) before any code of ours runs. There is
+deliberately no `{ valid: false }` body and no `rateLimit` (it would share the paid per-user
+bucket with extract/ask; the check costs one hash + one indexed SELECT). The app calls it when
+the user saves a license key in Settings.
 
 Issuing/revoking keys is HTTP-only (`POST`/`GET`/`PATCH /v1/admin/users`) — the old
 `scripts/add-user.ts` CLI and the raw-SQL deactivation step are gone. `ADMIN_KEY` is therefore

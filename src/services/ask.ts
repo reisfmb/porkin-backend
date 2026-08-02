@@ -1,6 +1,7 @@
 import { AskError, buildMessages, runAsker, type AskLlmResult } from "../llm/asker.js";
 import { assertReadOnlySql, SqlRejected } from "../llm/sqlGuard.js";
 import { recordUsage } from "../db/usage.js";
+import { costUsd } from "../pricing.js";
 import { config } from "../config.js";
 import { ApiError } from "../errors.js";
 import type { AskContext, AskResponse, AskStep } from "../types.js";
@@ -14,6 +15,12 @@ import type { AskContext, AskResponse, AskStep } from "../types.js";
  * server is what enforces it — a client could otherwise loop forever on our key.
  */
 export const MAX_STEPS = 3;
+
+// Note: MAX_STEPS and the monthly quota are independent budgets. The quota is
+// checked per HTTP request, so a question can trip it mid-loop and die with a
+// 402 after its earlier turns were already paid for. Chosen over exempting
+// in-flight questions, which would let a client spend past the cap by always
+// having one open.
 
 type AskInput = {
   question: string;
@@ -36,11 +43,14 @@ async function callModel(
       fileName: null,
       fileSize: null,
       inputTokens: result.inputTokens,
+      cachedInputTokens: result.cachedInputTokens,
       outputTokens: result.outputTokens,
+      costUsd: costUsd(config.model, result),
       ok: true,
     });
     return result;
   } catch (err) {
+    // Threw before reporting usage: real cost unknown, logs as 0 (see CLAUDE.md "Quota").
     recordUsage({
       userId,
       endpoint: "ask",
@@ -48,7 +58,9 @@ async function callModel(
       fileName: null,
       fileSize: null,
       inputTokens: null,
+      cachedInputTokens: null,
       outputTokens: null,
+      costUsd: 0,
       ok: false,
     });
     throw err;

@@ -27,6 +27,25 @@ function intEnv(name: string, fallback: number): number {
   return n;
 }
 
+// Like intEnv but allows fractions — money, not counts.
+function floatEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(`Invalid env var ${name}: expected positive number, got "${raw}"`);
+  }
+  return n;
+}
+
+// Optional price overrides (USD per 1M tokens) for the configured model, so a
+// provider price change ships as a variable edit rather than a code change.
+function optionalFloatEnv(name: string): number | undefined {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === "") return undefined;
+  return floatEnv(name, 0);
+}
+
 const MIN_ADMIN_KEY_LEN = 24;
 
 // Optional: gates /v1/admin/*. Unset → the admin routes are inert (always 401).
@@ -50,6 +69,12 @@ export const config = {
   adminKey: adminKeyEnv(),
   maxUploadMb: intEnv("MAX_UPLOAD_MB", 15),
   rateLimitPerMin: intEnv("RATE_LIMIT_PER_MIN", 20),
+  // Monthly spend cap given to NEW users. Existing users keep whatever is on
+  // their row — changing this never retroactively moves anyone's limit.
+  defaultMonthlyLimitUsd: floatEnv("DEFAULT_MONTHLY_LIMIT_USD", 1.0),
+  priceInputPerMtok: optionalFloatEnv("PRICE_INPUT_PER_MTOK"),
+  priceCachedInputPerMtok: optionalFloatEnv("PRICE_CACHED_INPUT_PER_MTOK"),
+  priceOutputPerMtok: optionalFloatEnv("PRICE_OUTPUT_PER_MTOK"),
 } as const;
 
 export const maxUploadBytes = config.maxUploadMb * 1024 * 1024;

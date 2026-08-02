@@ -18,6 +18,27 @@ export type LicenseStatus = {
   name: string;
 };
 
+// ---- GET /v1/usage ----
+// Duplicated in porkin-app (src/lib/usage/types.ts). Keep both copies identical.
+
+/**
+ * What the user has spent this period against their cap. All amounts are USD —
+ * our cost of serving them, unrelated to the app's display currency.
+ */
+export type UsageSummary = {
+  /** Inclusive ISO date (YYYY-MM-DD) the period started. */
+  periodStart: string;
+  /** Exclusive ISO date the period ends — i.e. the day the allowance resets. */
+  periodEnd: string;
+  limitUsd: number;
+  spentUsd: number;
+  /** Clamped at 0: an overshooting call can push spend past the limit. */
+  remainingUsd: number;
+  byEndpoint: { endpoint: string; calls: number; usd: number }[];
+  daily: { date: string; usd: number }[];
+  tokens: { input: number; output: number };
+};
+
 // ---- /v1/ask ----
 // Also duplicated in porkin-app (src/lib/ask/types.ts). Same reasoning as
 // above: a small stable JSON shape isn't worth a shared workspace.

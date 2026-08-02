@@ -74,6 +74,8 @@ export class AskError extends Error {
 export type AskLlmResult = {
   output: AskOutput;
   inputTokens: number | null;
+  /** Subset of inputTokens the provider served from cache — priced cheaper. */
+  cachedInputTokens: number | null;
   outputTokens: number | null;
 };
 
@@ -162,10 +164,13 @@ export async function runAsker(messages: ModelMessage[]): Promise<AskLlmResult> 
     throw new AskError("ask", err instanceof Error ? err.message : "Could not answer", err);
   }
 
-  const usage = result.usage as { inputTokens?: number; outputTokens?: number } | undefined;
+  const usage = result.usage as
+    | { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number }
+    | undefined;
   return {
     output: result.object,
     inputTokens: usage?.inputTokens ?? null,
+    cachedInputTokens: usage?.cachedInputTokens ?? null,
     outputTokens: usage?.outputTokens ?? null,
   };
 }

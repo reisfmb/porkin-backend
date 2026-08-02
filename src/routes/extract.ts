@@ -4,13 +4,15 @@ import { ApiError } from "../errors.js";
 import { extractStatement } from "../services/extraction.js";
 import { auth, type AppEnv } from "../middleware/auth.js";
 import { rateLimit } from "../middleware/rateLimit.js";
+import { quota } from "../middleware/quota.js";
 
 export const extractRoutes = new Hono<AppEnv>();
 
 // Path pattern must stay specific to this route: sub-app middleware is merged into
 // the parent by `app.route("/", …)`, so a broad "/v1/*" here would also gate
 // /v1/admin/* (which uses ADMIN_KEY, not license keys).
-extractRoutes.use("/v1/extract", auth, rateLimit);
+// quota last: it hits the DB, so let the in-memory rate limiter reject first.
+extractRoutes.use("/v1/extract", auth, rateLimit, quota);
 
 // Thin handler: validate the HTTP request, delegate to the service, respond.
 extractRoutes.post("/v1/extract", async (c) => {

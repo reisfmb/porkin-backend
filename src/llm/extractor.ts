@@ -55,6 +55,8 @@ export class ExtractError extends Error {
 export type ExtractResult = {
   transactions: ExtractedTransaction[];
   inputTokens: number | null;
+  /** Subset of inputTokens the provider served from cache — priced cheaper. */
+  cachedInputTokens: number | null;
   outputTokens: number | null;
 };
 
@@ -94,7 +96,9 @@ export async function runExtractor(
     );
   }
 
-  const usage = result.usage as { inputTokens?: number; outputTokens?: number } | undefined;
+  const usage = result.usage as
+    | { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number }
+    | undefined;
   const transactions: ExtractedTransaction[] = result.object.transactions.map((t) => ({
     date: t.date,
     rawName: t.description,
@@ -106,6 +110,7 @@ export async function runExtractor(
   return {
     transactions,
     inputTokens: usage?.inputTokens ?? null,
+    cachedInputTokens: usage?.cachedInputTokens ?? null,
     outputTokens: usage?.outputTokens ?? null,
   };
 }

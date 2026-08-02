@@ -35,4 +35,26 @@ export const MIGRATIONS: { version: number; sql: string }[] = [
       ALTER TABLE usage ADD COLUMN model TEXT;
     `,
   },
+  {
+    version: 3,
+    // Cost-based monthly quota. `cost_usd` is priced at insert time (see
+    // pricing.ts) so the quota check is one indexed SUM and a future price
+    // change can't rewrite history.
+    //
+    // `monthly_limit_usd`'s DEFAULT exists only to back-fill the rows that
+    // already exist — new users get their limit written explicitly from
+    // config.defaultMonthlyLimitUsd, so moving that env var never silently
+    // changes anyone's allowance.
+    //
+    // The back-fill prices historic rows at literal gpt-5.1 rates rather than
+    // importing pricing.ts: an applied migration must never change meaning
+    // because a constant elsewhere moved.
+    sql: `
+      ALTER TABLE users ADD COLUMN monthly_limit_usd REAL NOT NULL DEFAULT 1.0;
+      ALTER TABLE usage ADD COLUMN cost_usd REAL NOT NULL DEFAULT 0;
+      ALTER TABLE usage ADD COLUMN cached_input_tokens INTEGER;
+      UPDATE usage
+         SET cost_usd = (COALESCE(input_tokens, 0) * 1.25 + COALESCE(output_tokens, 0) * 10.0) / 1000000.0;
+    `,
+  },
 ];

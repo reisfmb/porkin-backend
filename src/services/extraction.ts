@@ -1,5 +1,6 @@
 import { runExtractor, ExtractError } from "../llm/extractor.js";
 import { recordUsage } from "../db/usage.js";
+import { costUsd } from "../pricing.js";
 import { config } from "../config.js";
 import { ApiError } from "../errors.js";
 import type { ExtractedTransaction } from "../types.js";
@@ -21,7 +22,10 @@ export async function extractStatement({
   userId,
 }: ExtractInput): Promise<ExtractedTransaction[]> {
   try {
-    const { transactions, inputTokens, outputTokens } = await runExtractor(pdfBytes, filename);
+    const { transactions, inputTokens, cachedInputTokens, outputTokens } = await runExtractor(
+      pdfBytes,
+      filename,
+    );
     recordUsage({
       userId,
       endpoint: "extract",
@@ -29,11 +33,15 @@ export async function extractStatement({
       fileName: filename,
       fileSize,
       inputTokens,
+      cachedInputTokens,
       outputTokens,
+      costUsd: costUsd(config.model, { inputTokens, cachedInputTokens, outputTokens }),
       ok: true,
     });
     return transactions;
   } catch (err) {
+    // The call threw before reporting usage, so its real cost is unknown and
+    // logs as 0 — a known undercount against the quota (see CLAUDE.md "Quota").
     recordUsage({
       userId,
       endpoint: "extract",
@@ -41,7 +49,9 @@ export async function extractStatement({
       fileName: filename,
       fileSize,
       inputTokens: null,
+      cachedInputTokens: null,
       outputTokens: null,
+      costUsd: 0,
       ok: false,
     });
     if (err instanceof ExtractError) {

@@ -50,23 +50,28 @@ src/
   index.ts              bootstrap: createApp() + node-server listen (thin)
   app.ts                createApp(): Hono, mounts middleware + routes + onError (no listen → testable)
   config.ts             env parse, fail-fast on missing PROVIDER_API_KEY
-  types.ts              ExtractedTransaction contract
+  types.ts              ExtractedTransaction + LicenseStatus + UsageSummary + ask contracts
   errors.ts             ApiError class + errorHandler (app.onError) — the ONLY place mapping errors→HTTP
   crypto.ts             sha256Hex + generateLicenseKey + secretEquals (constant-time)
+  pricing.ts            pure: USD per 1M tokens per model → costUsd() for one call
+  period.ts             pure: currentMonth() — the ONE definition of the quota period
   middleware/
     auth.ts             bearer-key middleware → throws ApiError; sets user; exports AppEnv
     admin.ts            ADMIN_KEY middleware (constant-time env compare) → throws ApiError(401)
     rateLimit.ts        in-memory per-user token bucket → throws ApiError(429); runs after auth
+    quota.ts            monthly USD spend cap → throws ApiError(402); runs after rateLimit
   routes/
     health.ts           GET /health (open)
     license.ts          GET /v1/license — `auth` + an empty handler; no service, no rateLimit
+    usage.ts            GET /v1/usage — `auth` only; what this month cost against the cap
     extract.ts          POST /v1/extract — thin: validate HTTP input → call service → respond
     ask.ts              POST /v1/ask — hand-validated JSON body; one turn of the text-to-SQL loop
-    admin.ts            /v1/admin/users CRUD-ish (create/list/activate) behind adminAuth
+    admin.ts            /v1/admin/users CRUD-ish (create/list/activate/set-limit) behind adminAuth
   services/
     extraction.ts       business logic: orchestrate extractor + usage; translate ExtractError→ApiError
     ask.ts              business logic: model call + SQL guard + retry + usage; MAX_STEPS lives here
-    users.ts            business logic: issue license keys, list users, toggle active
+    users.ts            business logic: issue license keys, list users (+ spend), toggle active, set limit
+    usage.ts            business logic: this period's spend vs the user's cap → UsageSummary
   llm/
     extractor.ts        provider factory + generateObject (ported from app); throws domain ExtractError
     asker.ts            ask prompt + message replay from `steps` + generateObject; throws AskError
@@ -74,8 +79,8 @@ src/
   db/
     client.ts           better-sqlite3 open + pragmas + migrate-on-start (reads DB_PATH, loadEnvFile)
     migrations.ts       append-only MIGRATIONS array
-    users.ts            User/UserSummary + findUserByKeyHash, insertUser, listUsers, setUserActive
-    usage.ts            UsageRow + insertUsage + recordUsage (best-effort)
+    users.ts            User/UserSummary (incl. monthlyLimitUsd) + find/insert/list/setActive/setLimit
+    usage.ts            UsageRow + recordUsage (best-effort) + the cost sums the quota/report read
 ```
 
 **Layering rule**: routes handle HTTP only (parse/validate/respond); services hold
@@ -142,14 +147,54 @@ Load-bearing details:
   app changes what a column *means*, `asker.ts`'s prompt has to change with it.
 - **Rate limit is per loop iteration**, so a 3-step question spends 3 tokens of
   `RATE_LIMIT_PER_MIN` (~6 questions/min at the default 20).
+- **The quota is checked per loop iteration too**, so a question can run out of budget
+  mid-loop and 402 after its earlier turns were already paid for. See Quota.
+
+## Quota — a monthly USD cap per user
+
+Rate limiting bounds requests per minute; this bounds **money per month**. Both are needed:
+20 extractions/min is fine as a burst and ruinous as a habit.
+
+- **The unit is USD of provider cost, not tokens.** Tokens aren't comparable across
+  input/cached/output, so a token cap would price a cheap month like an expensive one.
+- **Cost is computed at WRITE time** (`pricing.ts` → `usage.cost_usd`), never derived on read.
+  A price change therefore can't rewrite what past months cost, and the quota check is a single
+  indexed `SUM` over `idx_usage_user`. `PRICES` in `pricing.ts` is USD per 1M tokens and must be
+  checked against the provider's price page when `MODEL` changes; the configured model's rates
+  can also be overridden by env (`PRICE_*_PER_MTOK`) so a repricing ships without a code edit.
+  An unknown model bills at the fallback rate and warns once.
+- **`cached_input_tokens` is a SUBSET of `input_tokens`** (OpenAI's `prompt_tokens_details.
+  cached_tokens`), so `costUsd` subtracts it out before pricing the rest — never adds it on top.
+- **`period.ts` is the only definition of "a month"**: the UTC calendar month, `[start, end)`.
+  The middleware and `/v1/usage` both call it, so what's enforced and what's reported can't drift.
+  UTC over per-user timezones deliberately — the reset is a date we can state ("resets on the 1st").
+- **`users.monthly_limit_usd` is per user**, set explicitly at creation from
+  `DEFAULT_MONTHLY_LIMIT_USD` (1.00) and movable via `PATCH /v1/admin/users/:id`. The column
+  DEFAULT in migration 3 only back-fills pre-existing rows — changing the env var never
+  retroactively moves anyone's allowance. `GET /v1/admin/users` returns each user's cap next to
+  their month-to-date spend so a change is an informed one.
+- **Enforcement is a pre-check, so it overshoots by design.** A call's cost is unknowable until
+  it returns; a user at $0.99 of a $1.00 cap still gets one more call. The month lands at roughly
+  `limit + one call` (~$0.05 for an extraction), or `limit + N` under concurrency, bounded by the
+  rate limiter. Reserving an estimate up front would fix this and isn't worth the machinery.
+- **A failed LLM call logs `cost_usd = 0`** — it threw before reporting usage, so the tokens it
+  really burned are unknown. Real money the cap doesn't see. Acceptable while failures are rare;
+  if they stop being rare, estimate from the prompt instead of writing 0.
+- **402 `quota_exceeded`**, message carries the cap and the reset date. `/v1/license` and
+  `/v1/usage` are deliberately outside the gate: checking how much is left has to work precisely
+  when nothing is left.
+
+Rough gpt-5.1 costs, for sizing a limit: ~$0.05 per statement extraction, ~$0.02 per ask turn.
+So $1/month ≈ 20 statements or ~25 questions. These are estimates — the `usage` table has the
+real numbers, so retune from it rather than from this paragraph.
 
 ## Guards (in place — it's real money)
 
-Per-key rate limit (in-memory, fine for single instance), max upload size (Content-Length
-pre-check + actual size), `maxAskBytes` 1 MB cap on ask bodies (query results ride in `steps`, so
-they aren't otherwise bounded), a server-side `MAX_STEPS` budget, `assertReadOnlySql` on all
-generated SQL, 60s LLM-call timeout via `AbortSignal.timeout`. **Never log** the plaintext license
-key, `PROVIDER_API_KEY`, or `ADMIN_KEY`.
+Per-key rate limit (in-memory, fine for single instance), a per-user monthly USD cap (see Quota),
+max upload size (Content-Length pre-check + actual size), `maxAskBytes` 1 MB cap on ask bodies
+(query results ride in `steps`, so they aren't otherwise bounded), a server-side `MAX_STEPS`
+budget, `assertReadOnlySql` on all generated SQL, 60s LLM-call timeout via `AbortSignal.timeout`.
+**Never log** the plaintext license key, `PROVIDER_API_KEY`, or `ADMIN_KEY`.
 
 ## Auth model
 
@@ -173,9 +218,12 @@ deliberately no `{ valid: false }` body and no `rateLimit` (it would share the p
 bucket with extract/ask; the check costs one hash + one indexed SELECT). The app calls it when
 the user saves a license key in Settings.
 
-Issuing/revoking keys is HTTP-only (`POST`/`GET`/`PATCH /v1/admin/users`) — the old
-`scripts/add-user.ts` CLI and the raw-SQL deactivation step are gone. `ADMIN_KEY` is therefore
-the only way to mint license keys.
+`GET /v1/usage` sits next to it under the same rule — `auth` only, no `rateLimit`, and pointedly
+no `quota`: it is the endpoint that reports the quota, so it has to answer once the cap is hit.
+
+Issuing/revoking keys and setting spend caps is HTTP-only (`POST`/`GET`/`PATCH /v1/admin/users`)
+— the old `scripts/add-user.ts` CLI and the raw-SQL deactivation step are gone. `ADMIN_KEY` is
+therefore the only way to mint license keys.
 
 ## Deploy
 
@@ -201,5 +249,6 @@ Non-obvious constraints, all of them load-bearing:
 
 ## Not yet built (intentionally deferred)
 
-Anthropic/Google providers · quota enforcement / billing · automated tests · request
-logging/metrics beyond the `usage` table.
+Anthropic/Google providers · billing / payments (the quota caps spend, nothing charges for it) ·
+per-user notification when the cap is hit · automated tests · request logging/metrics beyond the
+`usage` table.

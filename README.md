@@ -21,9 +21,11 @@ src/
   config.ts       env parsing (fail-fast on missing PROVIDER_API_KEY)
   errors.ts       ApiError + errorHandler (the only place errors → HTTP)
   crypto.ts       key hashing + generation
-  middleware/     auth (bearer key) · admin (ADMIN_KEY) · rateLimit (token bucket)
-  routes/         health · extract · ask · admin (thin HTTP handlers)
-  services/       extraction · ask · users (business logic; framework-agnostic)
+  pricing.ts      token prices → USD cost of one model call
+  period.ts       the quota period (UTC calendar month), defined once
+  middleware/     auth (bearer key) · admin (ADMIN_KEY) · rateLimit (token bucket) · quota (monthly USD cap)
+  routes/         health · license · usage · extract · ask · admin (thin HTTP handlers)
+  services/       extraction · ask · users · usage (business logic; framework-agnostic)
   llm/            extractor (ported from porkin-app) · asker · sqlGuard
   db/             client · migrations · users · usage (repositories)
 Dockerfile        multi-stage build; what Railway deploys
@@ -63,15 +65,32 @@ The app calls it when the user saves a key in Settings.
 curl -i localhost:8787/v1/license -H "Authorization: Bearer <key>"
 ```
 
+### `GET /v1/usage`
+Auth required: `Authorization: Bearer <license-key>`.
+
+This month's spend against the user's cap. No LLM call, no usage row, not rate-limited, and
+**not** subject to the quota itself — it has to answer once the cap is hit. Amounts are USD of
+provider cost (unrelated to the app's display currency). Powers the desktop app's `/usage` page.
+
+- Success: `200 { periodStart, periodEnd, limitUsd, spentUsd, remainingUsd, byEndpoint, daily, tokens }`
+  — dates are `YYYY-MM-DD`, `periodEnd` is exclusive and is the day the allowance resets,
+  `remainingUsd` is clamped at 0, `byEndpoint` is `[{ endpoint, calls, usd }]` and `daily` is
+  `[{ date, usd }]`.
+- Errors: `401` unknown key · `403` inactive key.
+
+```bash
+curl localhost:8787/v1/usage -H "Authorization: Bearer <key>"
+```
+
 ### `POST /v1/extract`
 Auth required: `Authorization: Bearer <license-key>`.
 
 - Body: `multipart/form-data`, field `file` = the PDF.
 - Success: `200 { "transactions": ExtractedTransaction[] }`.
 - Errors: `{ "error": { "kind", "message" } }` with status
-  `400` bad input · `401` missing/invalid key · `403` inactive key ·
-  `413` file too large · `422` extraction/schema failure · `429` rate-limited ·
-  `504` provider timeout · `500` internal.
+  `400` bad input · `401` missing/invalid key · `402` monthly usage limit reached
+  (`kind: "quota_exceeded"`) · `403` inactive key · `413` file too large ·
+  `422` extraction/schema failure · `429` rate-limited · `504` provider timeout · `500` internal.
 
 `ExtractedTransaction`: `{ date, rawName, amount, currency, sourceFile }`
 (ISO date, signed amount — debit negative, credit positive).
@@ -95,7 +114,8 @@ stateless, so the full history travels in `steps` (max 3).
 - Success: `200 { status, sql, answer }` — `status: "sql"` ⇒ run `sql` and call again with a new
   step; `status: "answer"` ⇒ done, the unused field is `""`.
 - Errors: same `{ "error": { "kind", "message" } }` shape, with
-  `400` bad body / step budget exceeded · `401`/`403` key · `413` body too large ·
+  `400` bad body / step budget exceeded · `401`/`403` key · `402 quota_exceeded` monthly limit
+  reached (checked per turn, so a question can hit it mid-loop) · `413` body too large ·
   `422 ask_failed` couldn't answer or generated unsafe SQL · `429` rate-limited ·
   `504` provider timeout.
 
@@ -120,25 +140,45 @@ grants access to these routes **only** — it is not accepted on `/v1/extract` o
 
 | Route | Body | Response |
 |-------|------|----------|
-| `POST /v1/admin/users` | `{ "name": "Bruno" }` | `201 { id, name, key }` |
-| `GET /v1/admin/users` | — | `200 { users: [{ id, name, active, createdAt }] }` |
-| `PATCH /v1/admin/users/:id` | `{ "active": false }` | `200 { id, active }` |
+| `POST /v1/admin/users` | `{ "name": "Bruno", "monthlyLimitUsd": 5 }` | `201 { id, name, key, monthlyLimitUsd }` |
+| `GET /v1/admin/users` | — | `200 { users: [{ id, name, active, monthlyLimitUsd, spentUsd, createdAt }] }` |
+| `PATCH /v1/admin/users/:id` | `{ "active": false }` and/or `{ "monthlyLimitUsd": 5 }` | `200 { id, active?, monthlyLimitUsd? }` |
 
 `POST` returns the plaintext license `key` **once** — store it immediately, only its SHA-256
-hash is saved. `GET` never returns key hashes. `PATCH` toggles a key: a deactivated user's next
-request gets `403`. Unknown id → `404`.
+hash is saved. `monthlyLimitUsd` is optional there and defaults to `DEFAULT_MONTHLY_LIMIT_USD`;
+it is >0 and ≤1000. `GET` never returns key hashes, and reports each user's month-to-date
+`spentUsd` next to their cap. `PATCH` takes either field (at least one; sending neither is a
+`400`): `active: false` revokes a key — that user's next request gets `403` — and
+`monthlyLimitUsd` moves their cap, effective on their next request. Unknown id → `404`.
 
 ```bash
 curl -X POST localhost:8787/v1/admin/users \
   -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
-  -d '{"name":"Bruno"}'
+  -d '{"name":"Bruno","monthlyLimitUsd":5}'
 
 curl localhost:8787/v1/admin/users -H "Authorization: Bearer $ADMIN_KEY"
 
 curl -X PATCH localhost:8787/v1/admin/users/1 \
   -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
   -d '{"active":false}'
+
+curl -X PATCH localhost:8787/v1/admin/users/1 \
+  -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
+  -d '{"monthlyLimitUsd":10}'
 ```
+
+## Usage quota
+
+Every user has a monthly spend cap in **USD of provider cost** (`users.monthly_limit_usd`,
+default `DEFAULT_MONTHLY_LIMIT_USD` = $1.00). Each LLM call is priced at insert time from
+`src/pricing.ts` and stored on its `usage` row; `middleware/quota.ts` sums the current UTC
+calendar month before `/v1/extract` and `/v1/ask` and returns `402 quota_exceeded` once spend
+reaches the cap. Users see their own numbers at `GET /v1/usage`; operators see everyone's in the
+admin list.
+
+Two deliberate imprecisions: the check runs *before* a call whose cost isn't yet known, so a
+month can end slightly over the cap (~one call), and a call that fails before reporting usage
+logs `$0`. Rough gpt-5.1 costs: ~$0.05 per statement, ~$0.02 per ask turn, so $1 ≈ 20 statements.
 
 ## Environment
 
@@ -152,6 +192,10 @@ curl -X PATCH localhost:8787/v1/admin/users/1 \
 | `ADMIN_KEY` | — | Optional; gates `/v1/admin/*`. Min 24 chars. Unset ⇒ admin routes always `401`. |
 | `MAX_UPLOAD_MB` | `15` | |
 | `RATE_LIMIT_PER_MIN` | `20` | Per user key. |
+| `DEFAULT_MONTHLY_LIMIT_USD` | `1.00` | Spend cap given to **new** users. Existing users keep their row's value. |
+| `PRICE_INPUT_PER_MTOK` | from `pricing.ts` | Optional override for `MODEL`, USD per 1M tokens. |
+| `PRICE_CACHED_INPUT_PER_MTOK` | from `pricing.ts` | Optional. |
+| `PRICE_OUTPUT_PER_MTOK` | from `pricing.ts` | Optional. |
 
 ## Build & run (production)
 
@@ -186,8 +230,8 @@ Railway must be pointed at the subdirectory.
 3. **Settings → Volumes**: add a volume mounted at `/data`, and set `DB_PATH=/data/porkin.db`.
    Do this *before* creating users — without a volume, redeploys wipe all users/keys.
 4. **Variables**: `PROVIDER_API_KEY`, `ADMIN_KEY` (≥24 chars, else boot fails), `DB_PATH`,
-   optionally `MODEL` / `MAX_UPLOAD_MB` / `RATE_LIMIT_PER_MIN`. Leave `PORT` unset — Railway
-   injects it. `ADMIN_KEY` is the only way to mint license keys.
+   optionally `MODEL` / `MAX_UPLOAD_MB` / `RATE_LIMIT_PER_MIN` / `DEFAULT_MONTHLY_LIMIT_USD`.
+   Leave `PORT` unset — Railway injects it. `ADMIN_KEY` is the only way to mint license keys.
 5. **Settings → Networking → Generate Domain** → base URL for the desktop client.
 6. Logs should show `porkin-backend listening on :<port>`; the `/health` healthcheck
    (`railway.json`) goes green.

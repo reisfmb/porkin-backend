@@ -4,6 +4,7 @@ import { ApiError } from "../errors.js";
 import { answerQuestion, MAX_STEPS } from "../services/ask.js";
 import { auth, type AppEnv } from "../middleware/auth.js";
 import { rateLimit } from "../middleware/rateLimit.js";
+import { quota } from "../middleware/quota.js";
 import type { AskContext, AskStep } from "../types.js";
 
 export const askRoutes = new Hono<AppEnv>();
@@ -11,7 +12,9 @@ export const askRoutes = new Hono<AppEnv>();
 // Path pattern must stay specific to this route: sub-app middleware is merged
 // into the parent by `app.route("/", …)`, so a broad "/v1/*" here would also
 // gate /v1/admin/* (which uses ADMIN_KEY, not license keys).
-askRoutes.use("/v1/ask", auth, rateLimit);
+// quota last: it hits the DB, so let the in-memory rate limiter reject first.
+// Checked on every turn, so a question can run out of budget mid-loop.
+askRoutes.use("/v1/ask", auth, rateLimit, quota);
 
 const MAX_QUESTION_LENGTH = 500;
 const MAX_SCHEMA_LENGTH = 20_000;

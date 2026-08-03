@@ -5,8 +5,8 @@ import type { LicenseStatus } from "../types.js";
 export const licenseRoutes = new Hono<AppEnv>();
 
 // Path pattern must stay specific to this route: sub-app middleware is merged into
-// the parent by `app.route("/", …)`, so a broad "/v1/*" here would also gate
-// /v1/admin/* (which uses ADMIN_KEY, not license keys).
+// the parent by `app.route("/", …)`, so a broad "/v1/*" here would also gate every
+// other /v1 route — including any future one that isn't license-key authed.
 //
 // No `rateLimit`: it shares one per-user bucket with /v1/extract and /v1/ask, and a
 // free DB lookup shouldn't be able to starve paid calls. An unmetered hit costs one

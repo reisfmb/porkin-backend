@@ -124,7 +124,7 @@ const spendByUserStmt = db.prepare(
     GROUP BY user_id`,
 );
 
-/** Spend per user over a period, keyed by id — so the admin list can show it. */
+/** Spend per user over a period, keyed by id — so `admin.js list` can show it. */
 export function spendByUserBetween(fromIso: string, toIso: string): Map<number, number> {
   const rows = spendByUserStmt.all(fromIso, toIso) as { user_id: number; usd: number }[];
   return new Map(rows.map((r) => [r.user_id, r.usd]));

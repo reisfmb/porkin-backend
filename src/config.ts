@@ -46,19 +46,6 @@ function optionalFloatEnv(name: string): number | undefined {
   return floatEnv(name, 0);
 }
 
-const MIN_ADMIN_KEY_LEN = 24;
-
-// Optional: gates /v1/admin/*. Unset → the admin routes are inert (always 401).
-// A short admin key is worse than none, so reject weak ones at boot.
-function adminKeyEnv(): string | undefined {
-  const v = process.env.ADMIN_KEY?.trim();
-  if (!v) return undefined;
-  if (v.length < MIN_ADMIN_KEY_LEN) {
-    throw new Error(`Invalid env var ADMIN_KEY: must be at least ${MIN_ADMIN_KEY_LEN} chars`);
-  }
-  return v;
-}
-
 export const config = {
   // Railway injects PORT; default for local dev.
   port: intEnv("PORT", 8787),
@@ -66,7 +53,6 @@ export const config = {
   provider: process.env.PROVIDER?.trim() || "openai",
   model: process.env.MODEL?.trim() || "gpt-5.1",
   providerApiKey: required("PROVIDER_API_KEY"),
-  adminKey: adminKeyEnv(),
   maxUploadMb: intEnv("MAX_UPLOAD_MB", 15),
   rateLimitPerMin: intEnv("RATE_LIMIT_PER_MIN", 20),
   // Monthly spend cap given to NEW users. Existing users keep whatever is on

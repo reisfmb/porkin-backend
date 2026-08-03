@@ -23,11 +23,12 @@ src/
   crypto.ts       key hashing + generation
   pricing.ts      token prices → USD cost of one model call
   period.ts       the quota period (UTC calendar month), defined once
-  middleware/     auth (bearer key) · admin (ADMIN_KEY) · rateLimit (token bucket) · quota (monthly USD cap)
-  routes/         health · license · usage · extract · ask · admin (thin HTTP handlers)
+  middleware/     auth (bearer key) · rateLimit (token bucket) · quota (monthly USD cap)
+  routes/         health · license · usage · extract · ask (thin HTTP handlers)
   services/       extraction · ask · users · usage (business logic; framework-agnostic)
   llm/            extractor (ported from porkin-app) · asker · sqlGuard
   db/             client · migrations · users · usage (repositories)
+  scripts/        admin (operator CLI — the only way to manage users)
 Dockerfile        multi-stage build; what Railway deploys
 railway.json      builder + /health healthcheck + single replica
 ```
@@ -132,40 +133,33 @@ Generated SQL is validated (`llm/sqlGuard.ts`) to be a single read-only SELECT/W
 leaves the server; the client re-validates before executing. A rejected query gets one inline
 correction attempt.
 
-### Admin — `/v1/admin/*`
+## Administration
 
-Auth: `Authorization: Bearer $ADMIN_KEY`. The admin key is env-only (no `users` row) and
-grants access to these routes **only** — it is not accepted on `/v1/extract` or `/v1/ask`. If
-`ADMIN_KEY` is unset, every admin route returns `401`.
-
-| Route | Body | Response |
-|-------|------|----------|
-| `POST /v1/admin/users` | `{ "name": "Bruno", "monthlyLimitUsd": 5 }` | `201 { id, name, key, monthlyLimitUsd }` |
-| `GET /v1/admin/users` | — | `200 { users: [{ id, name, active, monthlyLimitUsd, spentUsd, createdAt }] }` |
-| `PATCH /v1/admin/users/:id` | `{ "active": false }` and/or `{ "monthlyLimitUsd": 5 }` | `200 { id, active?, monthlyLimitUsd? }` |
-
-`POST` returns the plaintext license `key` **once** — store it immediately, only its SHA-256
-hash is saved. `monthlyLimitUsd` is optional there and defaults to `DEFAULT_MONTHLY_LIMIT_USD`;
-it is >0 and ≤1000. `GET` never returns key hashes, and reports each user's month-to-date
-`spentUsd` next to their cap. `PATCH` takes either field (at least one; sending neither is a
-`400`): `active: false` revokes a key — that user's next request gets `403` — and
-`monthlyLimitUsd` moves their cap, effective on their next request. Unknown id → `404`.
+There is **no admin HTTP API** — user management is a CLI you run inside the container. Open
+Railway → the service → **Console** (or `railway ssh`) and run:
 
 ```bash
-curl -X POST localhost:8787/v1/admin/users \
-  -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
-  -d '{"name":"Bruno","monthlyLimitUsd":5}'
-
-curl localhost:8787/v1/admin/users -H "Authorization: Bearer $ADMIN_KEY"
-
-curl -X PATCH localhost:8787/v1/admin/users/1 \
-  -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
-  -d '{"active":false}'
-
-curl -X PATCH localhost:8787/v1/admin/users/1 \
-  -H "Authorization: Bearer $ADMIN_KEY" -H 'content-type: application/json' \
-  -d '{"monthlyLimitUsd":10}'
+node dist/scripts/admin.js create --name Bruno [--limit 5]
+node dist/scripts/admin.js list
+node dist/scripts/admin.js activate --id 3
+node dist/scripts/admin.js deactivate --id 3
+node dist/scripts/admin.js set-limit --id 3 --limit 10
 ```
+
+Locally the same commands run through tsx: `npm run admin:dev -- list`.
+
+- `create` prints the plaintext license key **once** — copy it immediately, only its SHA-256
+  hash is stored. `--limit` is optional and defaults to `DEFAULT_MONTHLY_LIMIT_USD`; it must be
+  >0 and ≤1000.
+- `list` shows every user with their cap next to their month-to-date spend. Key hashes are
+  never selected, so they can't be printed.
+- `deactivate` revokes a key: that user's next request gets `403`. `activate` reverses it.
+- `set-limit` moves a user's monthly cap, effective on their next request.
+- Unknown id, bad name, or out-of-range limit → message on stderr, exit 1.
+
+Console access to the box is the admin credential. That is deliberate: a shell there can read
+and write `porkin.db` directly, so an HTTP admin surface would only add a second
+remotely-reachable way to mint license keys. See `CLAUDE.md` → "Auth model".
 
 ## Usage quota
 
@@ -173,8 +167,8 @@ Every user has a monthly spend cap in **USD of provider cost** (`users.monthly_l
 default `DEFAULT_MONTHLY_LIMIT_USD` = $1.00). Each LLM call is priced at insert time from
 `src/pricing.ts` and stored on its `usage` row; `middleware/quota.ts` sums the current UTC
 calendar month before `/v1/extract` and `/v1/ask` and returns `402 quota_exceeded` once spend
-reaches the cap. Users see their own numbers at `GET /v1/usage`; operators see everyone's in the
-admin list.
+reaches the cap. Users see their own numbers at `GET /v1/usage`; operators see everyone's via
+`admin.js list`.
 
 Two deliberate imprecisions: the check runs *before* a call whose cost isn't yet known, so a
 month can end slightly over the cap (~one call), and a call that fails before reporting usage
@@ -189,7 +183,6 @@ logs `$0`. Rough gpt-5.1 costs: ~$0.05 per statement, ~$0.02 per ask turn, so $1
 | `PROVIDER` | `openai` | Informational; only openai is wired. |
 | `MODEL` | `gpt-5.1` | |
 | `PROVIDER_API_KEY` | — | **Required.** Boot fails without it. |
-| `ADMIN_KEY` | — | Optional; gates `/v1/admin/*`. Min 24 chars. Unset ⇒ admin routes always `401`. |
 | `MAX_UPLOAD_MB` | `15` | |
 | `RATE_LIMIT_PER_MIN` | `20` | Per user key. |
 | `DEFAULT_MONTHLY_LIMIT_USD` | `1.00` | Spend cap given to **new** users. Existing users keep their row's value. |
@@ -209,10 +202,12 @@ Or via the image that Railway builds (`Dockerfile`, multi-stage, `node:24-trixie
 ```bash
 docker build -t porkin-backend .
 docker run --rm -p 8788:8787 \
-  -e PROVIDER_API_KEY=sk-... -e ADMIN_KEY=... \
+  -e PROVIDER_API_KEY=sk-... \
   -e DB_PATH=/data/porkin.db -v "$PWD/.docker-data:/data" \
   porkin-backend
 ```
+
+To administer that container: `docker exec -it <id> node dist/scripts/admin.js list`.
 
 The base image tag is load-bearing: better-sqlite3's prebuilt binaries need `GLIBC_2.38+`, so
 bookworm (`node:24-slim`) fails at runtime. Install uses `--ignore-scripts` to skip a
@@ -227,17 +222,22 @@ Railway must be pointed at the subdirectory.
 1. **New Project → Deploy from GitHub repo** → this repo.
 2. **Settings → Source**: Root Directory = `porkin-backend`, branch `master`. Railway then
    finds `railway.json` + `Dockerfile` and uses the Dockerfile builder.
-3. **Settings → Volumes**: add a volume mounted at `/data`, and set `DB_PATH=/data/porkin.db`.
+3. **Settings → Volumes**: add a volume and point `DB_PATH` at a file inside it — the live
+   deployment mounts at `/app/data` with `DB_PATH=/app/data/porkin.db`. The two must agree.
    Do this *before* creating users — without a volume, redeploys wipe all users/keys.
-4. **Variables**: `PROVIDER_API_KEY`, `ADMIN_KEY` (≥24 chars, else boot fails), `DB_PATH`,
-   optionally `MODEL` / `MAX_UPLOAD_MB` / `RATE_LIMIT_PER_MIN` / `DEFAULT_MONTHLY_LIMIT_USD`.
-   Leave `PORT` unset — Railway injects it. `ADMIN_KEY` is the only way to mint license keys.
+4. **Variables**: `PROVIDER_API_KEY`, `DB_PATH`, optionally `MODEL` / `MAX_UPLOAD_MB` /
+   `RATE_LIMIT_PER_MIN` / `DEFAULT_MONTHLY_LIMIT_USD`. Leave `PORT` unset — Railway injects it.
 5. **Settings → Networking → Generate Domain** → base URL for the desktop client.
 6. Logs should show `porkin-backend listening on :<port>`; the `/health` healthcheck
    (`railway.json`) goes green.
 7. **Keep replicas at 1.** SQLite has one writer and the rate-limit buckets live in process
    memory, so a second replica doubles the effective limit (`railway.json` sets
    `numReplicas: 1`).
-8. Create the first user: `POST https://<app>/v1/admin/users` (see [Admin](#admin--v1admin)).
-9. Backups (it's real money): enable a volume backup schedule, or
-   `sqlite3 $DB_PATH ".backup '/data/backup.db'"` (WAL-safe).
+8. Create the first user from **Console**: `node dist/scripts/admin.js create --name <you>`
+   (see [Administration](#administration)).
+9. Backups (it's real money): enable a volume backup schedule. For an ad-hoc WAL-safe copy from
+   Console — the image has no `sqlite3` binary, so go through better-sqlite3:
+   ```bash
+   node -e 'new (require("better-sqlite3"))(process.env.DB_PATH,{readonly:true})
+     .backup(process.env.DB_PATH+".bak").then(()=>console.log("ok"))'
+   ```

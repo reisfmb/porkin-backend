@@ -9,8 +9,8 @@ import { quota } from "../middleware/quota.js";
 export const extractRoutes = new Hono<AppEnv>();
 
 // Path pattern must stay specific to this route: sub-app middleware is merged into
-// the parent by `app.route("/", …)`, so a broad "/v1/*" here would also gate
-// /v1/admin/* (which uses ADMIN_KEY, not license keys).
+// the parent by `app.route("/", …)`, so a broad "/v1/*" here would also gate every
+// other /v1 route — including any future one that isn't license-key authed.
 // quota last: it hits the DB, so let the in-memory rate limiter reject first.
 extractRoutes.use("/v1/extract", auth, rateLimit, quota);
 

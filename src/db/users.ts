@@ -48,7 +48,7 @@ export function insertUser(name: string, keyHash: string, monthlyLimitUsd: numbe
 }
 
 // Public shape: key_hash is deliberately never selected, so it can't leak out
-// through the admin API.
+// through the admin CLI's listing.
 export type UserSummary = Omit<User, "keyHash">;
 
 const listStmt = db.prepare(

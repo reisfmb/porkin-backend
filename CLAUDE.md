@@ -52,12 +52,11 @@ src/
   config.ts             env parse, fail-fast on missing PROVIDER_API_KEY
   types.ts              ExtractedTransaction + LicenseStatus + UsageSummary + ask contracts
   errors.ts             ApiError class + errorHandler (app.onError) — the ONLY place mapping errors→HTTP
-  crypto.ts             sha256Hex + generateLicenseKey + secretEquals (constant-time)
+  crypto.ts             sha256Hex + generateLicenseKey
   pricing.ts            pure: USD per 1M tokens per model → costUsd() for one call
   period.ts             pure: currentMonth() — the ONE definition of the quota period
   middleware/
     auth.ts             bearer-key middleware → throws ApiError; sets user; exports AppEnv
-    admin.ts            ADMIN_KEY middleware (constant-time env compare) → throws ApiError(401)
     rateLimit.ts        in-memory per-user token bucket → throws ApiError(429); runs after auth
     quota.ts            monthly USD spend cap → throws ApiError(402); runs after rateLimit
   routes/
@@ -66,7 +65,8 @@ src/
     usage.ts            GET /v1/usage — `auth` only; what this month cost against the cap
     extract.ts          POST /v1/extract — thin: validate HTTP input → call service → respond
     ask.ts              POST /v1/ask — hand-validated JSON body; one turn of the text-to-SQL loop
-    admin.ts            /v1/admin/users CRUD-ish (create/list/activate/set-limit) behind adminAuth
+  scripts/
+    admin.ts            operator CLI (create/list/activate/deactivate/set-limit); no HTTP equivalent
   services/
     extraction.ts       business logic: orchestrate extractor + usage; translate ExtractError→ApiError
     ask.ts              business logic: model call + SQL guard + retry + usage; MAX_STEPS lives here
@@ -110,10 +110,13 @@ in the service). `errorHandler` is the single seam that turns them into response
 - **Sub-app middleware is NOT scoped to the sub-app.** `app.route("/", subApp)` merges the
   sub-app's `use()` handlers into the parent, so their path patterns must be specific to the
   routes they guard — `extract.ts` uses `use("/v1/extract", …)`, not `"/v1/*"`, or license-key
-  `auth` would also gate `/v1/admin/*`.
+  `auth` would leak onto every other `/v1` route, including any future one that isn't
+  license-key authed. Every `/v1` route happens to be `auth`-gated today; don't rely on that.
 - **Build layout**: `rootDir` is `src`, so output is `dist/index.js` — hence `npm start` =
-  `node dist/index.js`. (Was `dist/src/…` while a `scripts/` dir existed; if you re-add
-  compiled scripts outside `src/`, `rootDir` and `start` both have to move back.)
+  `node dist/index.js`. This is why the operator CLI lives at **`src/scripts/admin.ts`**
+  (→ `dist/scripts/admin.js`): a top-level `scripts/` dir would widen the common root to the
+  package dir, output would become `dist/src/…`, and both `rootDir` and `start` would have to
+  move. Keep compiled scripts under `src/`.
 
 ## `/v1/ask` — text-to-SQL over a database we can't see
 
@@ -169,9 +172,9 @@ Rate limiting bounds requests per minute; this bounds **money per month**. Both 
   The middleware and `/v1/usage` both call it, so what's enforced and what's reported can't drift.
   UTC over per-user timezones deliberately — the reset is a date we can state ("resets on the 1st").
 - **`users.monthly_limit_usd` is per user**, set explicitly at creation from
-  `DEFAULT_MONTHLY_LIMIT_USD` (1.00) and movable via `PATCH /v1/admin/users/:id`. The column
+  `DEFAULT_MONTHLY_LIMIT_USD` (1.00) and movable via `admin.js set-limit`. The column
   DEFAULT in migration 3 only back-fills pre-existing rows — changing the env var never
-  retroactively moves anyone's allowance. `GET /v1/admin/users` returns each user's cap next to
+  retroactively moves anyone's allowance. `admin.js list` prints each user's cap next to
   their month-to-date spend so a change is an informed one.
 - **Enforcement is a pre-check, so it overshoots by design.** A call's cost is unknowable until
   it returns; a user at $0.99 of a $1.00 cap still gets one more call. The month lands at roughly
@@ -194,22 +197,19 @@ Per-key rate limit (in-memory, fine for single instance), a per-user monthly USD
 max upload size (Content-Length pre-check + actual size), `maxAskBytes` 1 MB cap on ask bodies
 (query results ride in `steps`, so they aren't otherwise bounded), a server-side `MAX_STEPS`
 budget, `assertReadOnlySql` on all generated SQL, 60s LLM-call timeout via `AbortSignal.timeout`.
-**Never log** the plaintext license key, `PROVIDER_API_KEY`, or `ADMIN_KEY`.
+**Never log** the plaintext license key or `PROVIDER_API_KEY`. (`admin.js create` prints a key
+to the operator's terminal once, by design — that's the only place plaintext appears.)
 
 ## Auth model
 
-Two independent credentials, both sent as `Authorization: Bearer <key>`:
+**Exactly one credential reaches the API: the license key.** Stored as SHA-256 hex
+(`key_hash`, unique) and sent as `Authorization: Bearer <key>`. Incoming key is hashed and
+looked up; no match → 401, `active=0` → 403. `middleware/auth.ts` attaches the user to the
+Hono context (`c.get("user")`) for handlers + usage logging.
 
-- **License key** (users). Stored as SHA-256 hex (`key_hash`, unique). Incoming key is hashed
-  and looked up; no match → 401, `active=0` → 403. `middleware/auth.ts` attaches the user to
-  the Hono context (`c.get("user")`) for handlers + usage logging.
-- **`ADMIN_KEY`** (operator). Env-only — no `users` row, no hashing at rest, compared
-  constant-time via `secretEquals`. Scopes **`/v1/admin/*` only**; unset ⇒ those routes always
-  401. It is deliberately **not** a bypass for `/v1/extract`: extract needs a real user row for
-  the `usage.user_id` FK and the rate-limit bucket key, and faking one would mean
-  special-casing usage logging. An operator who wants to extract issues themselves a normal
-  license key. If that ever changes, do it with an `is_admin` column + a real seeded row, not a
-  synthetic user object.
+Operator access is **shell access to the container**, not a token. Everything a person needs to
+administer the service is `src/scripts/admin.ts`, run from Railway → Console (or
+`railway ssh`). There is no `/v1/admin/*`, no `ADMIN_KEY`.
 
 `GET /v1/license` exposes that middleware as an endpoint: it is `auth` plus a handler that
 only echoes the user's name, so **reaching the handler is the verdict** — an unknown key 401s
@@ -221,9 +221,27 @@ the user saves a license key in Settings.
 `GET /v1/usage` sits next to it under the same rule — `auth` only, no `rateLimit`, and pointedly
 no `quota`: it is the endpoint that reports the quota, so it has to answer once the cap is hit.
 
-Issuing/revoking keys and setting spend caps is HTTP-only (`POST`/`GET`/`PATCH /v1/admin/users`)
-— the old `scripts/add-user.ts` CLI and the raw-SQL deactivation step are gone. `ADMIN_KEY` is
-therefore the only way to mint license keys.
+### Why admin is a CLI, not an API (this decision has flipped once — don't flip it back)
+
+It was `scripts/add-user.ts`, then `/v1/admin/*` behind an `ADMIN_KEY`, now `src/scripts/admin.ts`.
+The HTTP version existed only because there was no shell on the production box. Railway's web
+Console (and `railway ssh`) removed that constraint, and once you can get a root shell in the
+container the endpoint stops paying for itself: that shell already reads and writes
+`porkin.db` directly, so `/v1/admin/*` added no capability — only a second remotely-reachable
+credential that mints license keys, replicated across Railway variables, `.env`, shell history,
+and every pasted curl. Deleting it removed `middleware/admin.ts`, `routes/admin.ts`,
+`crypto.secretEquals`, `config.adminKey`, and the env var.
+
+What survives, and why it matters: **`services/users.ts` is unchanged and still
+framework-agnostic.** The CLI is a thin shell over it. If admin ever needs to be programmatic
+again — a payment webhook issuing a key, say — that is a new route calling `createUser()`
+directly; it never needed `/v1/admin/users` or a shared operator token. Only re-add an HTTP
+admin surface for something the console genuinely can't do.
+
+Also note `ADMIN_KEY` was deliberately never a bypass for `/v1/extract`: extract needs a real
+`users` row for the `usage.user_id` FK and the rate-limit bucket key. That still holds — an
+operator who wants to extract issues themselves a normal license key. If that ever changes, do
+it with an `is_admin` column + a real seeded row, not a synthetic user object.
 
 ## Deploy
 
@@ -239,12 +257,14 @@ Non-obvious constraints, all of them load-bearing:
   `node-gyp`, which needs python3/make/g++ *just to detect* the prebuild it already ships in
   the tarball (`prebuilds/linux-{x64,arm64}.node`, Node-API so Node-version-independent).
   Verified working on both amd64 (what Railway builds) and arm64.
-- **Volume at `/data` + `DB_PATH=/data/porkin.db`**, or redeploys wipe every license key.
+- **A volume with `DB_PATH` pointing inside it**, or redeploys wipe every license key. Live
+  deployment mounts at `/app/data` with `DB_PATH=/app/data/porkin.db` — the mount path and
+  `DB_PATH` must agree, and that's also where `admin.js` and any console poking will find the DB.
 - **Exactly one replica** (`numReplicas: 1`): single SQLite writer, and `rateLimit.ts` buckets
   are per-process — a second replica silently doubles the limit.
 - Runs as **root** in the container: Railway volumes are root-owned, so `USER node` would
   `EACCES` on the DB file.
-- `PROVIDER_API_KEY` + `ADMIN_KEY` come from Railway variables; `.dockerignore` keeps `.env`
+- `PROVIDER_API_KEY` comes from Railway variables; `.dockerignore` keeps `.env`
   out of the image.
 
 ## Not yet built (intentionally deferred)

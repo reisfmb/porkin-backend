@@ -5,7 +5,6 @@ import { licenseRoutes } from "./routes/license.js";
 import { usageRoutes } from "./routes/usage.js";
 import { extractRoutes } from "./routes/extract.js";
 import { askRoutes } from "./routes/ask.js";
-import { adminRoutes } from "./routes/admin.js";
 import type { AppEnv } from "./middleware/auth.js";
 
 // Assemble the app (no listen) so it can be constructed in tests too.
@@ -17,6 +16,5 @@ export function createApp() {
   app.route("/", usageRoutes);
   app.route("/", extractRoutes);
   app.route("/", askRoutes);
-  app.route("/", adminRoutes);
   return app;
 }
